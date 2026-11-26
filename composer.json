@@ -21,22 +21,27 @@
         "nyholm/psr7": "^1.8",
         "phpunit/phpunit": "^12.0",
         "phpstan/phpstan": "^2.1",
-        "phpbench/phpbench": "^1.7"
+        "phpbench/phpbench": "^1.7",
+        "infection/infection": "^0.35.4"
     },
     "scripts": {
-        "test": "@php vendor/bin/phpunit tests",
+        "test": "@php vendor/bin/phpunit --configuration phpunit.xml.dist",
         "phpstan": "@php vendor/bin/phpstan analyse src --level=8 --no-progress",
         "check": [
             "@phpstan",
             "@test"
         ],
-        "benchmark": "@php vendor/bin/phpbench run --report=aggregate"
+        "benchmark": "@php vendor/bin/phpbench run --report=aggregate",
+        "mutation": "@php vendor/bin/infection --threads=4 --min-msi=80 --min-covered-msi=80 --no-progress"
     },
     "config": {
         "audit": {
             "ignore-abandoned": {
                 "doctrine/annotations": "Transitive PHPBench development-only dependency; benchmarks use native attributes. Security advisories remain enforced."
             }
+        },
+        "allow-plugins": {
+            "infection/extension-installer": true
         }
     }
 }
