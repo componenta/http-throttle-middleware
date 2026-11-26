@@ -36,7 +36,9 @@ final readonly class FileRateLimiter implements RateLimiterInterface
                 $bucket = RateLimitBucket::fresh($now, $window);
             }
             [$next, $result] = $bucket->consume($limit, $now);
-            $this->write($file, $next);
+            if ($result->allowed || !is_file($file)) {
+                $this->write($file, $next);
+            }
         } finally {
             flock($lock, LOCK_UN);
             fclose($lock);

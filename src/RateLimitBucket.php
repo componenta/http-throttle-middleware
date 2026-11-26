@@ -34,6 +34,7 @@ final readonly class RateLimitBucket
         return new self($now + $window, 0);
     }
 
+    /** @return array{self, RateLimitResult} */
     public function consume(int $limit, int $now): array
     {
         if ($this->count > $limit || $this->expires <= $now) {
