@@ -59,8 +59,12 @@ final class ThrottleMiddleware implements MiddlewareInterface
         private readonly int $limit = 60,
         private readonly int $window = 60,
         private readonly ?\Closure $keyResolver = null,
+        private readonly ?string $policy = null,
     ) {
         RateLimitBucket::validatePolicy($limit, $window);
+        if ($policy === '') {
+            throw new \InvalidArgumentException('Rate limit policy must not be empty.');
+        }
     }
 
     #[\Override]
@@ -70,8 +74,8 @@ final class ThrottleMiddleware implements MiddlewareInterface
     ): ResponseInterface {
         $key = $this->resolveKey($request);
         [$limit, $window, $policy] = $this->resolveRateLimit($request);
-        if ($policy !== null) {
-            $key = RateLimitBucket::identity('policy:' . $policy, $key, $limit, $window);
+        if ($this->policy !== null || $policy !== null) {
+            $key = RateLimitBucket::identity(serialize(['middleware-policy', $this->policy, $policy]), $key, $limit, $window);
         }
 
         $result = $this->limiter->hit($key, $limit, $window);
@@ -96,7 +100,11 @@ final class ThrottleMiddleware implements MiddlewareInterface
     private function resolveKey(ServerRequestInterface $request): string
     {
         if ($this->keyResolver !== null) {
-            return ($this->keyResolver)($request);
+            $key = ($this->keyResolver)($request);
+            if (!is_string($key) || $key === '') {
+                throw new \UnexpectedValueException('Rate limit key resolver must return a non-empty string.');
+            }
+            return $key;
         }
 
         $ip = $request->getAttribute('client_ip') ?? $request->getServerParams()['REMOTE_ADDR'] ?? null;
@@ -104,7 +112,13 @@ final class ThrottleMiddleware implements MiddlewareInterface
             return '0.0.0.0';
         }
         $binary = inet_pton($ip);
-        return $binary === false ? '0.0.0.0' : (inet_ntop($binary) ?: '0.0.0.0');
+        if ($binary === false) {
+            return '0.0.0.0';
+        }
+        if (strlen($binary) === 16 && substr($binary, 0, 12) === str_repeat("\0", 10) . "\xff\xff") {
+            $binary = substr($binary, 12);
+        }
+        return inet_ntop($binary) ?: '0.0.0.0';
     }
 
     /**

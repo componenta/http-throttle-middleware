@@ -70,3 +70,5 @@ Successful responses receive `X-RateLimit-Limit` and `X-RateLimit-Remaining` hea
 This update changes the bucket storage format and cache keys, resetting old quotas. Deploy consistently across workers; retire old files separately. Configure an application error handler for `RateLimitStorageException`; choose any fail-open behavior explicitly at the application boundary. `X-RateLimit-*` are legacy fields, not the IETF RateLimit draft. Responses with status 429 include `Cache-Control: no-store`.
 
 Run tests with `composer test`.
+
+Set the optional middleware `policy:` name when independent middleware instances share a limiter and have identical limit/window settings. Route policy identifiers are nested under that name. A custom key resolver must return a non-empty string. IPv4 and IPv4-mapped IPv6 client addresses share a quota.
