@@ -8,16 +8,21 @@ namespace Componenta\Http\Middleware\Throttle;
  * Atomic fixed-window limiter for cooperating processes on a local filesystem.
  * Stable per-shard locks are never removed; expired data files are pruned only
  * while holding the corresponding lock. The directory must be private.
+ * Invoke collectExpired() from a maintenance process; hit() never scans it.
  */
 final readonly class FileRateLimiter implements RateLimiterInterface
 {
+    private string $directory;
+
     public function __construct(
-        private string $directory,
+        string $directory,
         private ?\Closure $clock = null,
     ) {
-        if (!is_dir($directory) || !is_writable($directory)) {
+        $resolved = realpath($directory);
+        if ($resolved === false || !is_dir($resolved) || !is_writable($resolved)) {
             throw new \InvalidArgumentException('Rate limit directory must exist and be writable.');
         }
+        $this->directory = $resolved;
     }
 
     #[\Override]
@@ -31,21 +36,20 @@ final readonly class FileRateLimiter implements RateLimiterInterface
             $now = $this->now();
             $file = $shard . DIRECTORY_SEPARATOR . $id . '.bucket';
             clearstatcache(true, $file);
+            if (is_link($file)) {
+                throw new RateLimitStorageException('Rate limit bucket must not be a symbolic link.');
+            }
             $bucket = is_file($file) ? $this->read($file) : RateLimitBucket::fresh($now, $window);
             if ($bucket->expires <= $now) {
                 $bucket = RateLimitBucket::fresh($now, $window);
             }
             [$next, $result] = $bucket->consume($limit, $now);
-            if ($result->allowed || !is_file($file)) {
+            if ($result->allowed) {
                 $this->write($file, $next);
             }
         } finally {
             flock($lock, LOCK_UN);
             fclose($lock);
-        }
-        // Amortize maintenance across shards without scanning all active keys.
-        if (random_int(1, 100) === 1) {
-            $this->pruneShard(sprintf('%02x', random_int(0, 255)));
         }
         return $result;
     }
@@ -121,40 +125,66 @@ final readonly class FileRateLimiter implements RateLimiterInterface
         }
     }
 
-    private function pruneShard(string $id): void
+    /**
+     * Collect expired buckets and abandoned temporary writes outside the HTTP
+     * hot path. Invoke periodically from a maintenance process. Busy buckets
+     * are skipped and retried on a later collection. Returns the number of
+     * expired bucket files removed (temporary files are not counted).
+     */
+    public function collectExpired(): int
     {
-        $directory = rtrim($this->directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'rl-v2-' . $id;
-        if (!is_dir($directory) || is_link($directory)) {
-            return;
-        }
-        $lock = @fopen($directory . DIRECTORY_SEPARATOR . '.lock', 'c+b');
-        if ($lock === false) {
-            return;
-        }
-        try {
-            if (!flock($lock, LOCK_EX | LOCK_NB)) {
-                return;
+        $removed = 0;
+        for ($i = 0; $i < 256; ++$i) {
+            $directory = rtrim($this->directory, DIRECTORY_SEPARATOR)
+                . DIRECTORY_SEPARATOR . 'rl-v2-' . sprintf('%02x', $i);
+            if (!is_dir($directory) || is_link($directory)) {
+                continue;
             }
-            $now = $this->now();
-            foreach (new \DirectoryIterator($directory) as $entry) {
-                if (!$entry->isFile() || $entry->isLink()
-                    || preg_match('/^[0-9a-f]{64}\.bucket$/D', $entry->getFilename()) !== 1) {
-                    continue;
-                }
-                try {
-                    $bucket = $this->read($entry->getPathname());
-                    if ($bucket->expires <= $now) {
-                        @unlink($entry->getPathname());
+            $lock = @fopen($directory . DIRECTORY_SEPARATOR . '.lock', 'c+b');
+            if ($lock === false) {
+                throw new RateLimitStorageException('Could not open rate limit maintenance lock.');
+            }
+            try {
+                // Iterate outside the lock; lock and re-check only one entry
+                // at a time so maintenance cannot block an entire hot shard.
+                foreach (new \DirectoryIterator($directory) as $entry) {
+                    $name = $entry->getFilename();
+                    $temporary = str_starts_with($name, '.rl-');
+                    if (!$temporary && preg_match('/^[0-9a-f]{64}\.bucket$/D', $name) !== 1) {
+                        continue;
                     }
-                } catch (RateLimitStorageException) {
-                    // Corruption must not reset a potentially active quota.
+                    if (!flock($lock, LOCK_EX | LOCK_NB)) {
+                        continue;
+                    }
+                    try {
+                        $file = $entry->getPathname();
+                        clearstatcache(true, $file);
+                        if (!is_file($file) || is_link($file)) {
+                            continue;
+                        }
+                        if ($temporary) {
+                            // Cooperating writers create temporary files only
+                            // while holding this same stable shard lock.
+                            @unlink($file);
+                            continue;
+                        }
+                        try {
+                            $expired = $this->read($file)->expires <= $this->now();
+                        } catch (RateLimitStorageException) {
+                            // Do not reset a potentially active corrupted quota.
+                            continue;
+                        }
+                        if ($expired && @unlink($file)) {
+                            ++$removed;
+                        }
+                    } finally {
+                        flock($lock, LOCK_UN);
+                    }
                 }
+            } finally {
+                fclose($lock);
             }
-        } catch (\UnexpectedValueException) {
-            // Maintenance is best-effort; enforcement already completed.
-        } finally {
-            flock($lock, LOCK_UN);
-            fclose($lock);
         }
+        return $removed;
     }
 }

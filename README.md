@@ -27,7 +27,7 @@ Both implement `RateLimiterInterface::hit(string $key, int $limit, int $window):
 
 `CacheRateLimiter` uses portable 64-character hashed PSR-16 keys. It is approximate: concurrent requests can exceed the limit because PSR-16 lacks atomic read-modify-write operations. Do not use it as a strict security boundary. Use an atomic backend for strict enforcement.
 
-`FileRateLimiter` stores buckets in a private local directory with stable per-shard locks and atomic replacement. Storage failures throw instead of allowing the request. Expired files are pruned using their stored expiry. Do not share the directory with untrusted users or use a filesystem without reliable flock and rename semantics.
+`FileRateLimiter` stores buckets in a private local directory with stable per-shard locks and atomic replacement. Storage failures throw instead of allowing the request. Expired files are pruned using their stored expiry by explicit maintenance. The request path never scans the directory. A relative directory is resolved once at construction. Do not share the directory with untrusted users or use a filesystem without reliable flock and rename semantics.
 
 `RateLimitResult` contains:
 
@@ -72,3 +72,7 @@ This update changes the bucket storage format and cache keys, resetting old quot
 Run tests with `composer test`.
 
 Set the optional middleware `policy:` name when independent middleware instances share a limiter and have identical limit/window settings. Route policy identifiers are nested under that name. A custom key resolver must return a non-empty string. IPv4 and IPv4-mapped IPv6 client addresses share a quota.
+
+## File storage maintenance
+
+Schedule `$limiter->collectExpired()` periodically in a separate worker or CLI job. The method returns the number of expired bucket files removed, cleans abandoned temporary writes, never deletes stable lock files, and skips busy entries. It is not called automatically by `hit()`. Configure storage capacity and monitoring according to client/key cardinality. Do not put personalized quota headers into a shared response cache, and run enforcement before any cache hit that must count against the quota.

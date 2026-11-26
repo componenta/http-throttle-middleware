@@ -42,7 +42,7 @@ final readonly class CacheRateLimiter implements RateLimiterInterface
             }
         }
         [$next, $result] = $bucket->consume($limit, $now);
-        if (!$this->cache->set($cacheKey, ['expires' => $next->expires, 'count' => $next->count], $result->retryAfter)) {
+        if ($result->allowed && !$this->cache->set($cacheKey, ['expires' => $next->expires, 'count' => $next->count], $result->retryAfter)) {
             throw new RateLimitStorageException('Could not persist rate limit bucket.');
         }
         return $result;
