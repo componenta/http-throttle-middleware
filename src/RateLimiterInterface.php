@@ -20,7 +20,10 @@ interface RateLimiterInterface
      * Attempts to consume one token from the rate limit bucket.
      *
      * Returns a result indicating whether the request is allowed and
-     * metadata for constructing rate limit response headers.
+     * metadata for constructing rate limit response headers. Limits and windows
+     * must be positive. Strict enforcement requires an atomic backend; an
+     * implementation must document weaker guarantees. Storage failures must
+     * not be represented as successful quota consumption.
      *
      * @param string $key    Identifier for the rate limit bucket
      * @param int    $limit  Maximum number of requests per window
