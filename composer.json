@@ -19,9 +19,17 @@
     "minimum-stability": "stable",
     "require-dev": {
         "nyholm/psr7": "^1.8",
-        "phpunit/phpunit": "^12.0"
+        "phpunit/phpunit": "^12.0",
+        "phpstan/phpstan": "^2.1",
+        "phpbench/phpbench": "^1.7"
     },
     "scripts": {
-        "test": "@php vendor/bin/phpunit tests"
+        "test": "@php vendor/bin/phpunit tests",
+        "phpstan": "@php vendor/bin/phpstan analyse src --level=8 --no-progress",
+        "check": [
+            "@phpstan",
+            "@test"
+        ],
+        "benchmark": "@php vendor/bin/phpbench run --report=aggregate"
     }
 }
