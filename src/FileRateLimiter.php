@@ -4,264 +4,155 @@ declare(strict_types=1);
 
 namespace Componenta\Http\Middleware\Throttle;
 
-use const DIRECTORY_SEPARATOR;
-
 /**
- * File-based fixed window rate limiter.
- *
- * Stores hit counts in individual files on the filesystem, one file per
- * rate limit key. This provides shared state across PHP processes without
- * external dependencies (Redis, APCu, etc.).
- *
- * Each file contains a single line: "{windowStart}:{count}".
- *
- * File locking (LOCK_EX) is used to prevent race conditions when multiple
- * processes access the same key concurrently. The lock is held for the
- * minimal duration required to read-increment-write.
- *
- * Stale files (expired windows) are lazily pruned using a probabilistic
- * strategy to avoid scanning the entire directory on every request.
- *
- * Fixed window algorithm: requests are counted within discrete time
- * windows of `$window` seconds. When a new window begins, the counter
- * resets to zero.
- *
- * @see https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/
+ * Atomic fixed-window limiter for cooperating processes on a local filesystem.
+ * Stable per-shard locks are never removed; expired data files are pruned only
+ * while holding the corresponding lock. The directory must be private.
  */
-final class FileRateLimiter implements RateLimiterInterface
+final readonly class FileRateLimiter implements RateLimiterInterface
 {
-    /**
-     * File prefix to identify rate limiter files during pruning.
-     */
-    private const string FILE_PREFIX = 'rl_';
-
-    /**
-     * Probability of triggering garbage collection (1 in N requests).
-     *
-     * On average, GC runs once per 100 requests. This amortizes the cost
-     * of directory scanning across many requests.
-     */
-    private const int GC_DIVISOR = 100;
-
-    /**
-     * Maximum file age in seconds before GC considers it stale.
-     *
-     * Set to 2 hours - well above any typical rate limit window.
-     * This avoids depending on the current request's $window value,
-     * which may differ per route.
-     */
-    private const int GC_MAX_AGE = 7200;
-
-    /**
-     * @param string        $directory Writable directory for rate limit files.
-     *                                 Must exist and be writable by the PHP process.
-     * @param \Closure|null $clock     Optional clock function for testing.
-     *                                 Returns current Unix timestamp.
-     */
     public function __construct(
-        private readonly string $directory,
-        private readonly ?\Closure $clock = null,
-    ) {}
+        private string $directory,
+        private ?\Closure $clock = null,
+    ) {
+        if (!is_dir($directory) || !is_writable($directory)) {
+            throw new \InvalidArgumentException('Rate limit directory must exist and be writable.');
+        }
+    }
 
     #[\Override]
     public function hit(string $key, int $limit, int $window): RateLimitResult
     {
-        $now = $this->now();
-        $file = $this->filePath($key);
-
-        // Probabilistic garbage collection
-        if (random_int(1, self::GC_DIVISOR) === 1) {
-            $this->prune($now);
-        }
-
-        $handle = fopen($file, 'c+');
-
-        if ($handle === false) {
-            // Cannot open file - fail open (allow request)
-            return new RateLimitResult(
-                allowed: true,
-                limit: $limit,
-                remaining: $limit - 1,
-                retryAfter: $window,
-            );
-        }
-
-        $handle = $this->lockFile($file, $handle);
-
-        if ($handle === false) {
-            return new RateLimitResult(
-                allowed: true,
-                limit: $limit,
-                remaining: $limit - 1,
-                retryAfter: $window,
-            );
-        }
-
+        RateLimitBucket::validatePolicy($limit, $window);
+        $id = RateLimitBucket::identity('componenta-throttle-file-v2', $key, $limit, $window);
+        $shard = $this->shard(substr($id, 0, 2));
+        $lock = $this->lock($shard);
         try {
-            $content = stream_get_contents($handle);
-            [$windowStart, $count] = $this->parse($content, $now);
-
-            // Window expired - reset
-            if (($now - $windowStart) >= $window) {
-                $windowStart = $now;
-                $count = 0;
+            $now = $this->now();
+            $file = $shard . DIRECTORY_SEPARATOR . $id . '.bucket';
+            clearstatcache(true, $file);
+            $bucket = is_file($file) ? $this->read($file) : RateLimitBucket::fresh($now, $window);
+            if ($bucket->expires <= $now) {
+                $bucket = RateLimitBucket::fresh($now, $window);
             }
-
-            $count++;
-
-            // Write back
-            ftruncate($handle, 0);
-            rewind($handle);
-            fwrite($handle, "$windowStart:$count");
-            fflush($handle);
+            [$next, $result] = $bucket->consume($limit, $now);
+            $this->write($file, $next);
         } finally {
-            flock($handle, LOCK_UN);
-            fclose($handle);
+            flock($lock, LOCK_UN);
+            fclose($lock);
         }
-
-        $retryAfter = $window - ($now - $windowStart);
-
-        if ($count > $limit) {
-            return new RateLimitResult(
-                allowed: false,
-                limit: $limit,
-                remaining: 0,
-                retryAfter: $retryAfter,
-            );
+        // Amortize maintenance across shards without scanning all active keys.
+        if (random_int(1, 100) === 1) {
+            $this->pruneShard(sprintf('%02x', random_int(0, 255)));
         }
-
-        return new RateLimitResult(
-            allowed: true,
-            limit: $limit,
-            remaining: $limit - $count,
-            retryAfter: $retryAfter,
-        );
-    }
-
-    /**
-     * Acquires an exclusive lock on the file, handling concurrent deletion.
-     *
-     * After acquiring LOCK_EX, checks if the file still exists on disk.
-     * A concurrent prune() may have unlinked the file between fopen() and
-     * flock(). On Linux, the handle would point to a detached inode -
-     * writes would succeed but data is lost on close.
-     *
-     * If the file was deleted, releases the stale handle, recreates the
-     * file, and locks the new handle.
-     *
-     * @param string   $file   File path
-     * @param resource $handle Open file handle
-     *
-     * @return resource|false Locked handle, or false on failure
-     */
-    private function lockFile(string $file, mixed $handle): mixed
-    {
-        flock($handle, LOCK_EX);
-
-        if (file_exists($file)) {
-            return $handle;
-        }
-
-        // File was unlinked - release stale handle and recreate
-        flock($handle, LOCK_UN);
-        fclose($handle);
-
-        $handle = fopen($file, 'c+');
-
-        if ($handle === false) {
-            return false;
-        }
-
-        flock($handle, LOCK_EX);
-
-        return $handle;
-    }
-
-    /**
-     * Parses file content into [windowStart, count].
-     *
-     * Returns [$now, 0] if content is missing or corrupted,
-     * effectively starting a fresh window.
-     *
-     * @return array{0: int, 1: int}
-     */
-    private function parse(string|false $content, int $now): array
-    {
-        if ($content === false || $content === '') {
-            return [$now, 0];
-        }
-
-        $parts = explode(':', $content, 2);
-
-        if (count($parts) !== 2 || !ctype_digit($parts[0]) || !ctype_digit($parts[1])) {
-            return [$now, 0];
-        }
-
-        return [(int) $parts[0], (int) $parts[1]];
-    }
-
-    /**
-     * Generates a filesystem-safe path for the given key.
-     *
-     * Keys are hashed with xxh128 to ensure consistent length and
-     * avoid filesystem character restrictions.
-     */
-    private function filePath(string $key): string
-    {
-        return $this->directory . DIRECTORY_SEPARATOR . self::FILE_PREFIX . hash('xxh128', $key);
-    }
-
-    /**
-     * Removes stale rate limit files.
-     *
-     * A file is considered stale if its modification time exceeds
-     * {@see GC_MAX_AGE} seconds. This is a fixed threshold independent
-     * of the per-request $window value, which may vary across routes.
-     *
-     * Each file is locked (LOCK_EX) before deletion to prevent removing
-     * a file that another process is currently reading/writing. On Linux,
-     * unlink() without a lock would remove the directory entry while the
-     * other process still holds the inode - causing data loss when the
-     * handle is closed.
-     */
-    private function prune(int $now): void
-    {
-        $threshold = $now - self::GC_MAX_AGE;
-        $pattern = $this->directory . DIRECTORY_SEPARATOR . self::FILE_PREFIX . '*';
-
-        foreach (glob($pattern) as $file) {
-            $handle = @fopen($file, 'c+');
-
-            if ($handle === false) {
-                continue;
-            }
-
-            try {
-                // Non-blocking lock - skip if another process is using the file
-                if (!flock($handle, LOCK_EX | LOCK_NB)) {
-                    continue;
-                }
-
-                // Re-check mtime after acquiring lock - file may have been
-                // updated between glob() and flock()
-                $mtime = filemtime($file);
-
-                if ($mtime !== false && $mtime < $threshold) {
-                    @unlink($file);
-                }
-            } finally {
-                flock($handle, LOCK_UN);
-                fclose($handle);
-            }
-        }
+        return $result;
     }
 
     private function now(): int
     {
-        if ($this->clock !== null) {
-            return ($this->clock)();
+        $now = $this->clock === null ? time() : ($this->clock)();
+        if (!is_int($now) || $now < 1) {
+            throw new \UnexpectedValueException('Rate limit clock must return a positive integer timestamp.');
         }
+        return $now;
+    }
 
-        return time();
+    private function shard(string $id): string
+    {
+        $path = rtrim($this->directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'rl-v2-' . $id;
+        if (!is_dir($path) && !@mkdir($path, 0700) && !is_dir($path)) {
+            throw new RateLimitStorageException('Could not create rate limit shard.');
+        }
+        if (is_link($path)) {
+            throw new RateLimitStorageException('Rate limit shard must not be a symbolic link.');
+        }
+        return $path;
+    }
+
+    /** @return resource */
+    private function lock(string $shard)
+    {
+        $handle = @fopen($shard . DIRECTORY_SEPARATOR . '.lock', 'c+b');
+        if ($handle === false) {
+            throw new RateLimitStorageException('Could not open rate limit lock.');
+        }
+        if (!flock($handle, LOCK_EX)) {
+            fclose($handle);
+            throw new RateLimitStorageException('Could not acquire rate limit lock.');
+        }
+        return $handle;
+    }
+
+    private function read(string $file): RateLimitBucket
+    {
+        $data = @file_get_contents($file, false, null, 0, 64);
+        if ($data === false || preg_match('/^([1-9][0-9]{0,18}):([0-9]{1,19})$/D', $data, $matches) !== 1) {
+            throw new RateLimitStorageException('Could not read rate limit bucket.');
+        }
+        $expires = filter_var($matches[1], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        $count = filter_var($matches[2], FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]);
+        if ($expires === false || $count === false) {
+            throw new RateLimitStorageException('Invalid rate limit bucket values.');
+        }
+        return new RateLimitBucket($expires, $count);
+    }
+
+    private function write(string $file, RateLimitBucket $bucket): void
+    {
+        $directory = dirname($file);
+        $temp = @tempnam($directory, '.rl-');
+        if ($temp === false) {
+            throw new RateLimitStorageException('Could not create temporary rate limit bucket.');
+        }
+        try {
+            if (realpath(dirname($temp)) !== realpath($directory)) {
+                throw new RateLimitStorageException('Temporary rate limit file must be in the bucket directory.');
+            }
+            $data = $bucket->expires . ':' . $bucket->count;
+            if (@file_put_contents($temp, $data) !== strlen($data) || !@rename($temp, $file)) {
+                throw new RateLimitStorageException('Could not persist rate limit bucket.');
+            }
+        } finally {
+            if (is_file($temp)) {
+                @unlink($temp);
+            }
+        }
+    }
+
+    private function pruneShard(string $id): void
+    {
+        $directory = rtrim($this->directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'rl-v2-' . $id;
+        if (!is_dir($directory) || is_link($directory)) {
+            return;
+        }
+        $lock = @fopen($directory . DIRECTORY_SEPARATOR . '.lock', 'c+b');
+        if ($lock === false) {
+            return;
+        }
+        try {
+            if (!flock($lock, LOCK_EX | LOCK_NB)) {
+                return;
+            }
+            $now = $this->now();
+            foreach (new \DirectoryIterator($directory) as $entry) {
+                if (!$entry->isFile() || $entry->isLink()
+                    || preg_match('/^[0-9a-f]{64}\.bucket$/D', $entry->getFilename()) !== 1) {
+                    continue;
+                }
+                try {
+                    $bucket = $this->read($entry->getPathname());
+                    if ($bucket->expires <= $now) {
+                        @unlink($entry->getPathname());
+                    }
+                } catch (RateLimitStorageException) {
+                    // Corruption must not reset a potentially active quota.
+                }
+            }
+        } catch (\UnexpectedValueException) {
+            // Maintenance is best-effort; enforcement already completed.
+        } finally {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
     }
 }

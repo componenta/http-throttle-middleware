@@ -25,9 +25,9 @@ This package has no config provider. Register a limiter and middleware explicitl
 
 Both implement `RateLimiterInterface::hit(string $key, int $limit, int $window): RateLimitResult`.
 
-`CacheRateLimiter` works with any PSR-16 cache, but PSR-16 does not provide atomic increments. Under high concurrency a few extra requests can pass through between read and write. Use a backend-specific limiter if strict atomicity is required.
+`CacheRateLimiter` uses portable 64-character hashed PSR-16 keys. It is approximate: concurrent requests can exceed the limit because PSR-16 lacks atomic read-modify-write operations. Do not use it as a strict security boundary. Use an atomic backend for strict enforcement.
 
-`FileRateLimiter` stores one lock-protected file per key in a writable directory. If it cannot open or lock a file, it fails open and allows the request instead of breaking the application request.
+`FileRateLimiter` stores buckets in a private local directory with stable per-shard locks and atomic replacement. Storage failures throw instead of allowing the request. Expired files are pruned using their stored expiry. Do not share the directory with untrusted users or use a filesystem without reliable flock and rename semantics.
 
 `RateLimitResult` contains:
 
@@ -53,13 +53,20 @@ $middleware = new ThrottleMiddleware(
 
 By default the key is `client_ip` request attribute or `REMOTE_ADDR`. A custom key resolver can use user id, API key, or another identifier.
 
-Per-route overrides can be passed through the `rate_limit` request attribute with `limit` and `window` keys.
+Per-route overrides can be passed through the `rate_limit` request attribute with positive integer `limit` and `window` keys and an optional non-empty string `policy` identifying the route quota. Use distinct policies for independently limited routes with identical settings.
 
 ```php
 $request = $request->withAttribute(ThrottleMiddleware::ATTR_RATE_LIMIT, [
+    'policy' => 'login',
     'limit' => 10,
     'window' => 60,
 ]);
 ```
 
 Successful responses receive `X-RateLimit-Limit` and `X-RateLimit-Remaining` headers. Rejected responses have status `429`, body `429 Too Many Requests`, and headers `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining: 0`.
+
+## Migration and failure handling
+
+This update changes the bucket storage format and cache keys, resetting old quotas. Deploy consistently across workers; retire old files separately. Configure an application error handler for `RateLimitStorageException`; choose any fail-open behavior explicitly at the application boundary. `X-RateLimit-*` are legacy fields, not the IETF RateLimit draft. Responses with status 429 include `Cache-Control: no-store`.
+
+Run tests with `composer test`.

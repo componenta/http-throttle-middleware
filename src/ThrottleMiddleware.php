@@ -17,8 +17,7 @@ use Psr\Http\Server\RequestHandlerInterface;
  * When the limit is exceeded, the middleware short-circuits the pipeline
  * and returns a 429 Too Many Requests response per RFC 6585 §4.
  *
- * Response headers follow the IETF RateLimit Fields draft specification
- * (draft-ietf-httpapi-ratelimit-headers):
+ * The middleware emits legacy X-RateLimit fields and standard Retry-After:
  *
  * - `X-RateLimit-Limit`:     Maximum requests per window
  * - `X-RateLimit-Remaining`: Remaining requests in current window
@@ -60,7 +59,9 @@ final class ThrottleMiddleware implements MiddlewareInterface
         private readonly int $limit = 60,
         private readonly int $window = 60,
         private readonly ?\Closure $keyResolver = null,
-    ) {}
+    ) {
+        RateLimitBucket::validatePolicy($limit, $window);
+    }
 
     #[\Override]
     public function process(
@@ -68,7 +69,10 @@ final class ThrottleMiddleware implements MiddlewareInterface
         RequestHandlerInterface $handler,
     ): ResponseInterface {
         $key = $this->resolveKey($request);
-        [$limit, $window] = $this->resolveRateLimit($request);
+        [$limit, $window, $policy] = $this->resolveRateLimit($request);
+        if ($policy !== null) {
+            $key = RateLimitBucket::identity('policy:' . $policy, $key, $limit, $window);
+        }
 
         $result = $this->limiter->hit($key, $limit, $window);
 
@@ -95,9 +99,12 @@ final class ThrottleMiddleware implements MiddlewareInterface
             return ($this->keyResolver)($request);
         }
 
-        return $request->getAttribute('client_ip')
-            ?? $request->getServerParams()['REMOTE_ADDR']
-            ?? '0.0.0.0';
+        $ip = $request->getAttribute('client_ip') ?? $request->getServerParams()['REMOTE_ADDR'] ?? null;
+        if (!is_string($ip) || filter_var($ip, FILTER_VALIDATE_IP) === false) {
+            return '0.0.0.0';
+        }
+        $binary = inet_pton($ip);
+        return $binary === false ? '0.0.0.0' : (inet_ntop($binary) ?: '0.0.0.0');
     }
 
     /**
@@ -106,20 +113,26 @@ final class ThrottleMiddleware implements MiddlewareInterface
      * Per-route overrides via request attributes take precedence
      * over the default configuration.
      *
-     * @return array{0: int, 1: int} [limit, window]
+     * @return array{int, int, ?string} [limit, window, policy]
      */
     private function resolveRateLimit(ServerRequestInterface $request): array
     {
         $override = $request->getAttribute(self::ATTR_RATE_LIMIT);
 
-        if (is_array($override)) {
-            return [
-                (int) ($override['limit'] ?? $this->limit),
-                (int) ($override['window'] ?? $this->window),
-            ];
+        if ($override === null) {
+            return [$this->limit, $this->window, null];
         }
-
-        return [$this->limit, $this->window];
+        if (!is_array($override)) {
+            throw new \InvalidArgumentException('Rate limit override must be an array.');
+        }
+        $limit = array_key_exists('limit', $override) ? $override['limit'] : $this->limit;
+        $window = array_key_exists('window', $override) ? $override['window'] : $this->window;
+        $policy = array_key_exists('policy', $override) ? $override['policy'] : 'route-default';
+        if (!is_int($limit) || !is_int($window) || !is_string($policy) || $policy === '') {
+            throw new \InvalidArgumentException('Invalid rate limit override.');
+        }
+        RateLimitBucket::validatePolicy($limit, $window);
+        return [$limit, $window, $policy];
     }
 
     /**
@@ -139,6 +152,8 @@ final class ThrottleMiddleware implements MiddlewareInterface
         $response = $this->responseFactory->createResponse(429);
 
         $response = $response
+            ->withHeader('Cache-Control', 'no-store')
+            ->withHeader('Content-Type', 'text/plain; charset=utf-8')
             ->withHeader('Retry-After', (string) $result->retryAfter)
             ->withHeader('X-RateLimit-Limit', (string) $result->limit)
             ->withHeader('X-RateLimit-Remaining', '0');

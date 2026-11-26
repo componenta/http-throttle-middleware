@@ -7,12 +7,21 @@
         "php": "^8.4",
         "psr/http-message": "^2.0",
         "psr/http-server-middleware": "^1.0",
-        "psr/simple-cache": "^3.0"
+        "psr/simple-cache": "^3.0",
+        "psr/http-factory": "^1.0",
+        "psr/http-server-handler": "^1.0"
     },
     "autoload": {
         "psr-4": {
             "Componenta\\Http\\Middleware\\Throttle\\": "src/"
         }
     },
-    "minimum-stability": "stable"
+    "minimum-stability": "stable",
+    "require-dev": {
+        "nyholm/psr7": "^1.8",
+        "phpunit/phpunit": "^12.0"
+    },
+    "scripts": {
+        "test": "@php vendor/bin/phpunit tests"
+    }
 }

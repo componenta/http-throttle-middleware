@@ -25,5 +25,9 @@ final readonly class RateLimitResult
         public int $limit,
         public int $remaining,
         public int $retryAfter,
-    ) {}
+    ) {
+        if ($limit < 1 || $remaining < 0 || $remaining > $limit || $retryAfter < 0 || (!$allowed && $remaining !== 0)) {
+            throw new \InvalidArgumentException('Invalid rate limit result.');
+        }
+    }
 }
