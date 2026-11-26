@@ -31,5 +31,12 @@
             "@test"
         ],
         "benchmark": "@php vendor/bin/phpbench run --report=aggregate"
+    },
+    "config": {
+        "audit": {
+            "ignore-abandoned": {
+                "doctrine/annotations": "Transitive PHPBench development-only dependency; benchmarks use native attributes. Security advisories remain enforced."
+            }
+        }
     }
 }
